@@ -22,11 +22,6 @@ DOMAIN = "dyness_battery"
 PLATFORMS = [Platform.SENSOR]
 SCAN_INTERVAL = timedelta(minutes=5)
 
-# Nominal pack voltage used for capacity calculations (16S LFP)
-_NOMINAL_PACK_V = 51.2
-_CELLS_PER_MODULE = 16
-_CELL_SPREAD_WARN_V = 0.020   # 20 mV
-
 
 def _get_gmt_time() -> str:
     return formatdate(timeval=None, localtime=False, usegmt=True)
@@ -145,9 +140,14 @@ def _parse_module_data(sn: str, pts: dict) -> dict:
         "max_discharge_current_a":      _to_float(pts.get("19200")),
     }
 
-    # ── Cell voltages (10300–11800) ──────────────────────────────────────────
+    # ── Derive per-module architecture from reported data ────────────────────
+    cells_per_module = _to_int(pts.get("10200")) or 16
+    # LFP nominal cell voltage (3.2 V) is a fixed electrochemical constant
+    nominal_pack_v = cells_per_module * 3.2
+
+    # ── Cell voltages (10300–(10200 + cells_per_module*100)) ─────────────────
     cells = []
-    for i in range(1, _CELLS_PER_MODULE + 1):
+    for i in range(1, cells_per_module + 1):
         pid = str(10200 + i * 100)
         v = _to_float(pts.get(pid))
         d[f"cell_{i}_v"] = v
@@ -162,21 +162,18 @@ def _parse_module_data(sn: str, pts: dict) -> dict:
         d["cell_voltage_max"]       = cmax
         d["cell_voltage_min"]       = cmin
         d["cell_voltage_spread_mv"] = round(spread * 1000, 1)
-        d["cell_voltage_spread_health"] = (
-            "OK" if spread < _CELL_SPREAD_WARN_V else "WARNING ≥20 mV"
-        )
 
     # ── Capacity derived ─────────────────────────────────────────────────────
     rated_ah  = d.get("rated_capacity_ah") or 100.0
     soh_pct   = d.get("soh") or 100.0
-    rated_kwh = round(rated_ah * _NOMINAL_PACK_V / 1000, 3)
+    rated_kwh = round(rated_ah * nominal_pack_v / 1000, 3)
     d["rated_capacity_kwh"] = rated_kwh
     d["usable_kwh"]         = round(rated_kwh * (soh_pct / 100), 3)
 
     # ── Internal resistance per cell ─────────────────────────────────────────
     if d.get("internal_resistance_mohm") is not None:
         d["internal_resistance_per_cell_mohm"] = round(
-            d["internal_resistance_mohm"] / _CELLS_PER_MODULE, 4
+            d["internal_resistance_mohm"] / cells_per_module, 4
         )
 
     # ── Alarm summary ────────────────────────────────────────────────────────
@@ -194,8 +191,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass,
         entry.data["api_id"],
         entry.data["api_secret"],
-        entry.data["device_sn"],
-        entry.data["dongle_sn"],
         entry.data["api_base"],
     )
     await coordinator.async_config_entry_first_refresh()
@@ -214,19 +209,18 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 class DynessDataCoordinator(DataUpdateCoordinator):
 
-    def __init__(self, hass, api_id, api_secret, device_sn, dongle_sn, api_base):
+    def __init__(self, hass, api_id, api_secret, api_base):
         super().__init__(hass, _LOGGER, name=DOMAIN, update_interval=SCAN_INTERVAL)
         self.api_id     = api_id
         self.api_secret = api_secret
-        self.device_sn  = device_sn
-        self.dongle_sn  = dongle_sn
         self.api_base   = api_base
         self.station_info  = {}
         self.device_info   = {}
         self.storage_info  = {}
         self.realtime_data = {}
 
-        # Module discovery state
+        # Discovered at runtime
+        self.device_sn: str | None = None
         self._module_sns: list[str] = []
         self._modules_bound: bool = False
 
@@ -236,33 +230,33 @@ class DynessDataCoordinator(DataUpdateCoordinator):
                 # Increased timeout to accommodate module fetching (4 modules × ~4s each)
                 async with async_timeout.timeout(90):
 
-                    # ── BMS device binding (once at startup) ─────────────────
-                    if not getattr(self, "_bound", False):
+                    # ── Auto-discover BMS SN (once) ───────────────────────────
+                    if not self.device_sn:
                         try:
-                            bind_result = await _api_call(
+                            sl_result = await _api_call(
                                 session, self.api_id, self.api_secret, self.api_base,
-                                "/v1/device/bindSn",
-                                {"deviceSn": self.device_sn, "collectorSn": self.dongle_sn}
+                                "/v1/device/storage/list", {}
                             )
-                            bind_code = str(bind_result.get("code", ""))
-                            if bind_code in ("0", "200", "500"):
-                                self._bound = True
-                                if bind_code == "500":
-                                    _LOGGER.debug("Dyness bindSn: already bound (500) – OK")
-                                else:
-                                    _LOGGER.debug("Dyness bindSn: success")
-                            else:
-                                raise UpdateFailed(
-                                    f"Dyness: device binding failed (code {bind_code}). "
-                                    f"Check: (1) API ID/Secret correct? "
-                                    f"(2) deviceSn correct? (format: R07ABCDEF123456-BMS) "
-                                    f"(3) collectorSn correct? (WiFi dongle SN, no -BMS) "
-                                    f"(4) device online in Dyness app?"
+                            if str(sl_result.get("code", "")) in ("0", "200"):
+                                device_list = (sl_result.get("data", {}) or {}).get("list", [])
+                                bms = next(
+                                    (d for d in device_list
+                                     if str(d.get("deviceSn", "")).endswith("-BMS")),
+                                    device_list[0] if device_list else None,
                                 )
+                                if bms:
+                                    sn = bms.get("deviceSn", "")
+                                    self.device_sn = sn if sn.endswith("-BMS") else sn + "-BMS"
+                                    _LOGGER.info("Dyness: discovered BMS SN %s", self.device_sn)
+                                else:
+                                    raise UpdateFailed(
+                                        "Dyness: no devices found on this API account. "
+                                        "Check API credentials."
+                                    )
                         except UpdateFailed:
                             raise
                         except Exception as e:
-                            _LOGGER.warning("Dyness bindSn unreachable: %s", e)
+                            raise UpdateFailed(f"Dyness: BMS discovery failed: {e}") from e
 
                     # ── Static data (loaded once at startup) ─────────────────
                     if not self.station_info:
@@ -281,7 +275,7 @@ class DynessDataCoordinator(DataUpdateCoordinator):
                             result = await _api_call(
                                 session, self.api_id, self.api_secret, self.api_base,
                                 "/v1/device/household/storage/detail",
-                                {"deviceSn": self.device_sn, "collectorSn": self.dongle_sn}
+                                {"deviceSn": self.device_sn}
                             )
                             if str(result.get("code", "")) in ("0", "200"):
                                 self.device_info = result.get("data", {}) or {}
@@ -292,8 +286,7 @@ class DynessDataCoordinator(DataUpdateCoordinator):
                     try:
                         result = await _api_call(
                             session, self.api_id, self.api_secret, self.api_base,
-                            "/v1/device/storage/list",
-                            {"deviceSn": self.device_sn, "collectorSn": self.dongle_sn}
+                            "/v1/device/storage/list", {}
                         )
                         if str(result.get("code", "")) in ("0", "200"):
                             device_list = (result.get("data", {}) or {}).get("list", [])
@@ -310,7 +303,7 @@ class DynessDataCoordinator(DataUpdateCoordinator):
                         rt_result = await _api_call(
                             session, self.api_id, self.api_secret, self.api_base,
                             "/v1/device/realTime/data",
-                            {"deviceSn": self.device_sn, "collectorSn": self.dongle_sn}
+                            {"deviceSn": self.device_sn}
                         )
                         if str(rt_result.get("code", "")) in ("0", "200"):
                             raw = rt_result.get("data", []) or []
@@ -346,7 +339,7 @@ class DynessDataCoordinator(DataUpdateCoordinator):
                                 bind_r = await _api_call(
                                     session, self.api_id, self.api_secret, self.api_base,
                                     "/v1/device/bindSn",
-                                    {"deviceSn": sn, "collectorSn": self.dongle_sn}
+                                    {"deviceSn": sn}
                                 )
                                 _LOGGER.debug(
                                     "Dyness bindSn %s: code=%s", sn, bind_r.get("code")
@@ -364,7 +357,7 @@ class DynessDataCoordinator(DataUpdateCoordinator):
                             m_result = await _api_call(
                                 session, self.api_id, self.api_secret, self.api_base,
                                 "/v1/device/realTime/data",
-                                {"deviceSn": sn, "collectorSn": self.dongle_sn}
+                                {"deviceSn": sn}
                             )
                             if str(m_result.get("code", "")) in ("0", "200"):
                                 m_raw = m_result.get("data", []) or []
@@ -389,8 +382,7 @@ class DynessDataCoordinator(DataUpdateCoordinator):
                     result = await _api_call(
                         session, self.api_id, self.api_secret, self.api_base,
                         "/v1/device/getLastPowerDataBySn",
-                        {"pageNo": 1, "pageSize": 1,
-                         "deviceSn": self.device_sn, "collectorSn": self.dongle_sn}
+                        {"pageNo": 1, "pageSize": 1, "deviceSn": self.device_sn}
                     )
 
                     code = str(result.get("code", ""))
