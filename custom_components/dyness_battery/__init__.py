@@ -321,6 +321,7 @@ class DynessDataCoordinator(DataUpdateCoordinator):
 
                     # ── Auto-discover module SNs from BMS SUB point ───────────
                     # Point "SUB" = comma-separated sub-device SNs (e.g. DYNESS01,DYNESS02,...)
+                    # Point "400" = module count (fallback when SUB is absent on fresh install)
                     if not self._module_sns and self.realtime_data:
                         sub_raw = self.realtime_data.get("SUB", "")
                         if sub_raw:
@@ -328,9 +329,29 @@ class DynessDataCoordinator(DataUpdateCoordinator):
                                 s.strip() for s in str(sub_raw).split(",") if s.strip()
                             ]
                             _LOGGER.info(
-                                "Dyness: discovered %d module(s): %s",
+                                "Dyness: discovered %d module(s) via SUB: %s",
                                 len(self._module_sns), self._module_sns
                             )
+                        else:
+                            # Fallback: construct SNs from module count (point 400) + BMS prefix
+                            try:
+                                mod_count = int(self.realtime_data.get("400") or 0)
+                                if mod_count > 0 and self.device_sn:
+                                    prefix = (
+                                        self.device_sn[:-4]
+                                        if self.device_sn.endswith("-BMS")
+                                        else self.device_sn
+                                    )
+                                    self._module_sns = [
+                                        f"{prefix}-DYNESS{i:02d}"
+                                        for i in range(1, mod_count + 1)
+                                    ]
+                                    _LOGGER.info(
+                                        "Dyness: constructed %d module SN(s) from point 400: %s",
+                                        len(self._module_sns), self._module_sns
+                                    )
+                            except (TypeError, ValueError):
+                                pass
 
                     # ── Bind module SNs (once per session) ───────────────────
                     if self._module_sns and not self._modules_bound:

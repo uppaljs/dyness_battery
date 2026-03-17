@@ -73,35 +73,50 @@ MODULE_SENSORS = [
 async def async_setup_entry(hass, entry, async_add_entities):
     coordinator = hass.data[DOMAIN][entry.entry_id]
     available_data = coordinator.data or {}
-    entities = []
 
     # ── Pack-level sensors ────────────────────────────────────────────────────
+    pack_entities = []
     for key, translation_key, unit, device_class, state_class, icon, precision in PACK_SENSORS:
         if key in _ALWAYS_REGISTER or available_data.get(key) is not None:
-            entities.append(
+            pack_entities.append(
                 DynessSensor(coordinator, entry, key, translation_key,
                              unit, device_class, state_class, icon, precision)
             )
+    async_add_entities(pack_entities)
 
-    # ── Module sensors — added after first coordinator refresh ────────────────
-    # coordinator.data["module_data"] is populated before sensor setup runs
-    for mid, mdata in (available_data.get("module_data") or {}).items():
-        # Summary sensors
-        for (data_key, trans_key, unit, dev_cls, state_cls,
-             icon, enabled, precision) in MODULE_SENSORS:
-            entities.append(
-                DynessModuleSensor(
-                    coordinator, entry, mid, data_key, trans_key,
-                    unit, dev_cls, state_cls, icon, enabled, precision,
+    # ── Module sensors — added dynamically as modules are discovered ──────────
+    # Modules may not be known on the first refresh (SUB point absent until
+    # after initial binding). A listener watches every coordinator update and
+    # registers entities for any newly appearing module IDs.
+    known_module_ids: set = set()
+
+    def _add_new_module_entities() -> None:
+        module_data = (coordinator.data or {}).get("module_data", {})
+        new_mids = [mid for mid in module_data if mid not in known_module_ids]
+        if not new_mids:
+            return
+        new_entities = []
+        for mid in new_mids:
+            known_module_ids.add(mid)
+            for (data_key, trans_key, unit, dev_cls, state_cls,
+                 icon, enabled, precision) in MODULE_SENSORS:
+                new_entities.append(
+                    DynessModuleSensor(
+                        coordinator, entry, mid, data_key, trans_key,
+                        unit, dev_cls, state_cls, icon, enabled, precision,
+                    )
                 )
-            )
-        # Individual cell voltage sensors (disabled by default)
-        for cell_num in range(1, 17):
-            entities.append(
-                DynessModuleCellSensor(coordinator, entry, mid, cell_num)
-            )
+            for cell_num in range(1, 17):
+                new_entities.append(
+                    DynessModuleCellSensor(coordinator, entry, mid, cell_num)
+                )
+        if new_entities:
+            async_add_entities(new_entities)
 
-    async_add_entities(entities)
+    # Fire once immediately (covers modules known from first refresh)
+    _add_new_module_entities()
+    # Register listener for modules discovered in subsequent refreshes
+    entry.async_on_unload(coordinator.async_add_listener(_add_new_module_entities))
 
 
 # ── Pack-level sensor entity ──────────────────────────────────────────────────
